@@ -1,0 +1,188 @@
+#!perl
+use 5.16.0;
+package Garcon;
+use MooseX::POE;
+use namespace::autoclean;
+
+use HTTP::Body;
+use JSON 2 ();
+use LWP::UserAgent::POE;
+use MIME::Base64;
+use POE::Component::Server::SimpleHTTP;
+use Time::Duration::Parse;
+use Time::Duration;
+use YAML::XS;
+
+my $config = {
+  twilio_sid  => ...,
+  twilio_from => ...,
+};
+
+$config->{twilio_auth} = encode_base64(
+  "$config->{twilio_sid}:...",
+  '',
+);
+
+my $JSON = JSON->new;
+
+my %user_for = (
+  phone_number => 'username',
+);
+
+has httpd => (
+  is => 'bare',
+  builder => '_build_httpd',
+);
+
+has httpd_port => (is => 'ro', lazy => 1, default => 9119);
+
+sub START {
+  my ($self, $kernel) = @_[ OBJECT, KERNEL ];
+  $kernel->alias_set('Garcon');
+}
+
+sub _build_httpd {
+  my ($self) = @_;
+  my $session_id = $self->get_session_id;
+
+  POE::Component::Server::SimpleHTTP->new(
+    ALIAS   => 'httpd',
+    ADDRESS => 0,
+    PORT    => $self->httpd_port,
+    HANDLERS => [
+      {
+        DIR => '^/sms$',
+        SESSION => 'Garcon',
+        EVENT => '_http_sms',
+      },
+      {
+        DIR => '.*',
+        SESSION => 'Garcon',
+        EVENT => '_http_404',
+      },
+    ],
+    HEADERS => { Server => 'Garcon' },
+  );
+}
+
+has user_status => (
+  is  => 'ro',
+  isa => 'HashRef',
+  init_arg => undef,
+  default  => sub {  {}  },
+);
+
+event _http_sms => sub {
+  my ($kernel, $self, $request, $response, $dirmatch)
+    = @_[ KERNEL, OBJECT, ARG0 .. ARG2 ];
+
+  # Check for errors
+  if (! defined $request) {
+    $kernel->call('httpd', 'DONE', $response );
+    return;
+  }
+
+  my $body = HTTP::Body->new(
+    scalar $request->header('Content-Type'),
+    scalar $request->header('Content-Length'),
+  );
+  $body->add( $request->content );
+
+  my $from = $body->param->{From} // '';
+  $from =~ s/\A\+1//;
+
+  my $who = $user_for{$from};
+
+  unless ($body->param->{AccountSid} eq $config->{twilio_sid} and $who) {
+    $response->code(400);
+    $response->content("Bad request");
+    $kernel->call( 'httpd', 'DONE', $response );
+    $self->info(sprintf "Bad request for %s from phone %s from IP %s",
+      $request->uri->path_query,
+      $from,
+      $response->connection->remote_ip,
+    );
+    return;
+  }
+
+  my $text = $body->param->{Body};
+
+  if (my $item = delete $self->user_status->{ $who }) {
+    my $then = $item->{time};
+    my $now  = time;
+    my $what = $item->{what};
+
+    my ($file) = split /\v/, $what;
+    $file =~ tr/-A-Za-z0-9/-/cs;
+    $file = "unknown" unless length $file;
+
+    # XXX: error handling
+    my $now_str  = localtime $now;
+    my $then_str = localtime $then;
+    open my $out, '>', "/home/rjbs/Dropbox/Pobox/garcon/$who/$then-$file.txt";
+    print {$out} "$what\n\nstart: $then_str\nend  : $now_str\n\n$text\n";
+    close $out;
+
+    $response->code(200);
+    $response->content("I have recorded your feelings.");
+  } else {
+    $self->user_status->{ $who } = { time => time, what => $text };
+    $response->code(200);
+    $response->content("I will ask you about that in a little bit.");
+    $kernel->delay_add(
+      'sms',
+      1800,
+      $from,
+      "How was it?  By 'it', I mean:\n\n$text",
+    );
+  }
+
+  $kernel->call( 'httpd', 'DONE', $response );
+
+  warn "Request from " . $response->connection->remote_ip . " " . $request->uri->path_query;
+};
+
+event _http_404 => sub {
+  my ($kernel, $self, $request, $response, $dirmatch)
+    = @_[ KERNEL, OBJECT, ARG0 .. ARG2 ];
+
+  if (! defined $request) {
+    $kernel->call('httpd', 'DONE', $response );
+    return;
+  }
+
+  # Do our stuff to HTTP::Response
+  $response->code(404);
+  $response->content( "Hi visitor from " . $response->connection->remote_ip . ", Page not found -> '" . $request->uri->path . "'\n\n" );
+
+  # We are done!
+  # For speed, you could use $_[KERNEL]->call( ... )
+  $kernel->call( 'httpd', 'DONE', $response );
+
+  $self->info("Request from " . $response->connection->remote_ip . " " . $request->uri->path_query);
+};
+
+event sms => sub {
+  warn "sms!\n";
+  my ($kernel, $self, $number, $msg) = @_[KERNEL, OBJECT, ARG0, ARG1];
+
+  my $ua = LWP::UserAgent::POE->new;
+  my $res = $ua->post(
+    "https://api.twilio.com/2010-04-01/Accounts/$config->{twilio_sid}/SMS/Messages",
+    {
+      From => $config->{twilio_from},
+      To   => $number,
+      Body => $msg,
+    },
+    Authorization => "Basic $config->{twilio_auth}",
+  );
+
+  warn $res->as_string;
+};
+
+sub BUILD {
+  my ($self) = @_;
+}
+
+my $garcon = Garcon->new;
+POE::Kernel->run;
